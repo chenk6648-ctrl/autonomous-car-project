@@ -1,0 +1,734 @@
+import sensor
+import image
+import time
+import math
+from pyb import Timer, Pin
+# ============================  TUNING  ===============================
+# =====================================================================
+# ---------- Servo ----------
+SERVO_CENTER = 1500
+SERVO_MIN = 1200
+SERVO_MAX = 1800
+SERVO_DIR = -1
+# ---------- Motor ----------
+MOTOR_STRAIGHT = 23
+MOTOR_SHARP = 10
+MOTOR_LOST = 12
+SPEED_K = 0.20
+SPEED_CONF_PENALTY = 4
+# ---------- Control (AGGRESSIVE) ----------
+KP = 1.30
+KF = 0.20
+EN_BOOST_THRESHOLD = 18
+EN_BOOST = 1
+HD_BOOST_THRESHOLD = 7
+HD_BOOST = 1.8
+ANGLE_LIMIT = 45
+STEER_SMOOTH = 0.65
+MAX_ANGLE_STEP = 35
+# ---------- Early hard turn ----------
+EARLY_HARD_TURN_ENABLE = True
+EARLY_HARD_HD_THRESHOLD = 7
+EARLY_HARD_MIN_ANGLE = 30
+EARLY_HARD_KP_SCALE = 0.25
+# ---------- Camera offset ----------
+CAMERA_OFFSET_PX = 0
+# ---------- Center jump protection ----------
+CENTER_JUMP_PX = 25
+CENTER_PREV_WEIGHT_MID = 0.55
+CENTER_PREV_WEIGHT_LOW = 0.75
+CENTER_PREV_WEIGHT_HIGH = 0.25
+NC_JUMP_LIMIT = 30
+FC_JUMP_LIMIT = 30
+# ---------- Lost-line strategy ----------
+LOST_HOLD_FRAMES = 30
+LOST_STOP_FRAMES = 80
+# ---------- Lane geometry ----------
+LANE_WIDTH_NEAR = 146
+LANE_WIDTH_NEAR_MIN = 125
+LANE_WIDTH_NEAR_MAX = 168
+LANE_WIDTH_FAR = 101
+LANE_WIDTH_FAR_MIN = 65
+LANE_WIDTH_FAR_MAX = 135
+EXPECTED_L_NEAR_X = 7
+EXPECTED_R_NEAR_X = 153
+EXPECTED_L_FAR_X = 30
+EXPECTED_R_FAR_X = 130
+# ---------- Vision ----------
+WHITE_THRESHOLD = (160, 255)
+LOCK_EXPOSURE = True
+HOUGH_THRESHOLD = 600
+THETA_MARGIN = 10
+RHO_MARGIN = 12
+# ---------- Image cleanup ----------
+PRE_BLUR = True
+MORPH_ERODE_ITER = 1
+MORPH_DILATE_ITER = 1
+USE_CANNY = False
+CANNY_THRESHOLD = (60, 120)
+# ---------- Line filtering ----------
+ANGLE_FILTER = 70
+CURVE_ALLOWANCE = 30
+MIN_LINE_MAG = 12
+MIN_LINE_LEN_PX = 14
+SIDE_TOLERANCE_PX = 8
+SIDE_MAJORITY_RATIO = 0.60
+CONTINUITY_WEIGHT_NEAR = 7
+CONTINUITY_WEIGHT_FAR = 5
+# ---------- ROI ----------
+Y_FAR_TOP = 15
+Y_FAR_BOT = 65
+Y_NEAR_TOP = 65
+Y_NEAR_BOT = 119
+# ---------- Startup / debug ----------
+ARM_DELAY_S = 5
+PRINT_EVERY_N = 5
+USE_WORK_COPY = True
+DEBUG_VIEW = "binary"
+# ========================  END OF TUNING  ============================
+# ========================= Pins / Timers =========================
+SERVO_PIN = Pin("P8")
+MOTOR_PIN = Pin("P4")
+IN_A = Pin("P5", Pin.OUT_PP)
+IN_B = Pin("P6", Pin.OUT_PP)
+SERVO_TIMER = Timer(4, prescaler=239, period=9999)
+SERVO_CH = SERVO_TIMER.channel(2, Timer.PWM, pin=SERVO_PIN)
+MOTOR_TIMER = Timer(2, freq=1600)
+MOTOR_CH = MOTOR_TIMER.channel(3, Timer.PWM, pin=MOTOR_PIN)
+# ========================= Camera =========================
+sensor.reset()
+sensor.set_pixformat(sensor.GRAYSCALE)
+sensor.set_framesize(sensor.QQVGA)
+sensor.skip_frames(time=2000)
+if LOCK_EXPOSURE:
+    sensor.set_auto_gain(False)
+    sensor.set_auto_whitebal(False)
+    try:
+        sensor.set_auto_exposure(False)
+    except Exception:
+        print("auto exposure lock not supported on this firmware")
+
+clock = time.clock()
+W = sensor.width()
+H = sensor.height()
+CENTER_X = W // 2
+TARGET_X = CENTER_X + CAMERA_OFFSET_PX
+
+LEFT_FAR_ROI = (0, Y_FAR_TOP, CENTER_X, Y_FAR_BOT - Y_FAR_TOP)
+RIGHT_FAR_ROI = (CENTER_X, Y_FAR_TOP, CENTER_X, Y_FAR_BOT - Y_FAR_TOP)
+LEFT_NEAR_ROI = (0, Y_NEAR_TOP, CENTER_X, Y_NEAR_BOT - Y_NEAR_TOP)
+RIGHT_NEAR_ROI = (CENTER_X, Y_NEAR_TOP, CENTER_X, Y_NEAR_BOT -
+Y_NEAR_TOP)
+
+Y_FAR_SAMPLE = (Y_FAR_TOP + Y_FAR_BOT) // 2
+Y_NEAR_SAMPLE = Y_NEAR_BOT
+
+CONF_HIGH = 2
+CONF_MID = 1
+CONF_LOW = 0
+
+
+# ========================= Helpers =========================
+def clamp(x, lo, hi):
+    return lo if x < lo else (hi if x > hi else x)
+
+
+def servo_write(us):
+    us = int(clamp(us, SERVO_MIN, SERVO_MAX))
+    SERVO_CH.pulse_width(us)
+
+
+def motor_write(percent):
+    if percent > 0:
+        IN_A.high()
+        IN_B.low()
+    else:
+        IN_A.low()
+        IN_B.low()
+
+    percent = int(clamp(percent, 0, 100))
+    MOTOR_CH.pulse_width_percent(percent)
+
+
+def normalize_angle(theta):
+    a = int(theta) - 90
+    if a > 90:
+        a -= 180
+    elif a < -90:
+        a += 180
+    return a
+
+
+def line_x_at_y(l, y):
+    x1 = l.x1()
+    y1 = l.y1()
+    x2 = l.x2()
+    y2 = l.y2()
+
+    if y2 == y1:
+        return (x1 + x2) // 2
+
+    return int(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+
+
+def line_length(l):
+    dx = l.x2() - l.x1()
+    dy = l.y2() - l.y1()
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def conf_to_text(conf):
+    if conf is None:
+        return "-"
+    if conf == CONF_HIGH:
+        return "H"
+    if conf == CONF_MID:
+        return "M"
+    return "L"
+
+
+def mode_side(mode):
+    if mode is None:
+        return None
+    if mode == "BOTH":
+        return None
+    return mode[0]
+
+
+# ========================= Vision preprocessing =========================
+def make_work_image(img):
+    if USE_WORK_COPY:
+        work = img.copy()
+    else:
+        work = img
+
+    if PRE_BLUR:
+        work.gaussian(1)
+
+    work.binary([WHITE_THRESHOLD])
+
+    for _ in range(MORPH_ERODE_ITER):
+        work.erode(1)
+    for _ in range(MORPH_DILATE_ITER):
+        work.dilate(1)
+
+    if USE_CANNY:
+        work.find_edges(image.EDGE_CANNY, threshold=CANNY_THRESHOLD)
+
+    return work
+
+
+# ========================= Line filtering =========================
+def line_mostly_on_side(l, side, y_top, y_bot):
+    y_mid = (y_top + y_bot) // 2
+    xs = (l.x1(), l.x2(), line_x_at_y(l, y_mid))
+
+    if side == "L":
+        boundary = CENTER_X + SIDE_TOLERANCE_PX
+        if xs[0] < boundary and xs[1] < boundary:
+            return True
+        side_count = 0
+        for x in xs:
+            if x < CENTER_X:
+                side_count += 1
+    else:
+        boundary = CENTER_X - SIDE_TOLERANCE_PX
+        if xs[0] >= boundary and xs[1] >= boundary:
+            return True
+        side_count = 0
+        for x in xs:
+            if x >= CENTER_X:
+                side_count += 1
+
+    return (side_count / 3.0) >= SIDE_MAJORITY_RATIO
+
+
+def valid_line(l, side, y_top, y_bot):
+    if l.magnitude() < MIN_LINE_MAG:
+        return False
+    if line_length(l) < MIN_LINE_LEN_PX:
+        return False
+    if abs(normalize_angle(l.theta())) > ANGLE_FILTER:
+        return False
+    if not line_mostly_on_side(l, side, y_top, y_bot):
+        return False
+
+    xb = line_x_at_y(l, y_bot)
+    xt = line_x_at_y(l, y_top)
+
+    if xb < -SIDE_TOLERANCE_PX or xb > W + SIDE_TOLERANCE_PX:
+        return False
+    if xt < -SIDE_TOLERANCE_PX or xt > W + SIDE_TOLERANCE_PX:
+        return False
+
+    if side == "L" and xt < xb - CURVE_ALLOWANCE:
+        return False
+    if side == "R" and xt > xb + CURVE_ALLOWANCE:
+        return False
+
+    return True
+
+
+def best_line(lines, side, y_top, y_bot, expected_x, last_xb, continuity_weight):
+    if not lines:
+        return None
+
+    best = None
+    best_score = -1000000000
+
+    for l in lines:
+        if not valid_line(l, side, y_top, y_bot):
+            continue
+
+        angle = normalize_angle(l.theta())
+        xb = line_x_at_y(l, y_bot)
+        expected_penalty = abs(xb - expected_x) * 5
+        continuity_penalty = 0
+
+        if last_xb is not None:
+            continuity_penalty = abs(xb - last_xb) * continuity_weight
+
+        score = (
+            int(l.magnitude()) * 2
+            + int(line_length(l)) * 3
+            - expected_penalty
+            - abs(angle) * 3
+            - continuity_penalty
+        )
+
+        if score > best_score:
+            best_score = score
+            best = l
+
+    return best
+
+
+def find_lane_line(work, roi, side, y_top, y_bot, expected_x, last_xb, continuity_weight):
+    lines = work.find_lines(
+        roi=roi,
+        threshold=HOUGH_THRESHOLD,
+        theta_margin=THETA_MARGIN,
+        rho_margin=RHO_MARGIN,
+    )
+
+    return best_line(
+        lines,
+        side,
+        y_top,
+        y_bot,
+        expected_x,
+        last_xb,
+        continuity_weight,
+    )
+
+
+# ========================= Center estimate =========================
+def estimate_center_with_check(
+    left_line,
+    right_line,
+    y,
+    lane_width_typ,
+    lane_width_min,
+    lane_width_max,
+    expected_l_x,
+    expected_r_x,
+):
+    if left_line and right_line:
+        lx = line_x_at_y(left_line, y)
+        rx = line_x_at_y(right_line, y)
+        lw = rx - lx
+
+        if lane_width_min <= lw <= lane_width_max:
+            return (lx + rx) // 2, "BOTH", lw, CONF_HIGH
+
+        l_dev = abs(lx - expected_l_x)
+        r_dev = abs(rx - expected_r_x)
+
+        if l_dev <= r_dev:
+            return lx + lane_width_typ // 2, "LEFT*", lw, CONF_LOW
+        return rx - lane_width_typ // 2, "RIGHT*", lw, CONF_LOW
+
+    if left_line:
+        lx = line_x_at_y(left_line, y)
+        return lx + lane_width_typ // 2, "LEFT", None, CONF_MID
+
+    if right_line:
+        rx = line_x_at_y(right_line, y)
+        return rx - lane_width_typ // 2, "RIGHT", None, CONF_MID
+
+    return None, None, None, None
+
+
+def smooth_center(current, last, conf):
+    if last is None or current is None:
+        return current
+
+    jump = abs(current - last)
+
+    if conf == CONF_LOW or jump > CENTER_JUMP_PX:
+        a = CENTER_PREV_WEIGHT_LOW
+    elif conf == CONF_MID:
+        a = CENTER_PREV_WEIGHT_MID
+    else:
+        a = CENTER_PREV_WEIGHT_HIGH
+
+    return int(a * last + (1.0 - a) * current)
+
+
+def combined_conf(conf_near, conf_far):
+    if conf_near is None and conf_far is None:
+        return None
+    if conf_near is None:
+        return conf_far
+    if conf_far is None:
+        return conf_near
+    return min(conf_near, conf_far)
+
+
+def kf_for_conf(conf):
+    if conf == CONF_HIGH:
+        return KF
+    if conf == CONF_MID:
+        return KF * 0.65
+    return KF * 0.35
+
+
+def kp_effective(err_near):
+    if abs(err_near) > EN_BOOST_THRESHOLD:
+        return KP * EN_BOOST
+    return KP
+
+
+def kf_effective(heading_err, conf):
+    base = kf_for_conf(conf)
+    if abs(heading_err) > HD_BOOST_THRESHOLD:
+        return base * HD_BOOST
+    return base
+
+
+def apply_early_hard_turn(err_near, heading_err, kp_used, kf_used):
+    normal_raw = kp_used * err_near + kf_used * heading_err
+
+    if not EARLY_HARD_TURN_ENABLE:
+        return normal_raw
+
+    if abs(heading_err) >= EARLY_HARD_HD_THRESHOLD:
+        if heading_err > 0:
+            turn_dir = 1
+        else:
+            turn_dir = -1
+
+        predictive_raw = (
+            EARLY_HARD_KP_SCALE * kp_used * err_near
+            + kf_used * heading_err
+        )
+
+        if turn_dir > 0:
+            predictive_raw = max(predictive_raw, EARLY_HARD_MIN_ANGLE)
+        else:
+            predictive_raw = min(predictive_raw, -EARLY_HARD_MIN_ANGLE)
+
+        return predictive_raw
+
+    return normal_raw
+
+def update_continuity(mode, left_line, right_line, y_bot, last_l_xb, last_r_xb):
+    if mode in ("BOTH", "LEFT", "LEFT*") and left_line:
+        last_l_xb = line_x_at_y(left_line, y_bot)
+    if mode in ("BOTH", "RIGHT", "RIGHT*") and right_line:
+        last_r_xb = line_x_at_y(right_line, y_bot)
+    return last_l_xb, last_r_xb
+
+
+def draw_debug(img, lines, near_center, far_center):
+    img.draw_rectangle(LEFT_FAR_ROI, color=60)
+    img.draw_rectangle(RIGHT_FAR_ROI, color=60)
+    img.draw_rectangle(LEFT_NEAR_ROI, color=120)
+    img.draw_rectangle(RIGHT_NEAR_ROI, color=120)
+
+    for ln in lines:
+        if ln:
+            img.draw_line(ln.line(), color=255)
+
+    if near_center is not None:
+        img.draw_cross(int(near_center), Y_NEAR_SAMPLE, color=255)
+    if far_center is not None:
+        img.draw_cross(int(far_center), Y_FAR_SAMPLE, color=255)
+
+    if near_center is not None and far_center is not None:
+        img.draw_line(
+            int(near_center),
+            Y_NEAR_SAMPLE,
+            int(far_center),
+            Y_FAR_SAMPLE,
+            color=255,
+        )
+
+
+# ========================= Startup =========================
+print("ARMING...")
+servo_write(SERVO_CENTER)
+IN_A.low()
+IN_B.low()
+motor_write(0)
+time.sleep(ARM_DELAY_S)
+
+print("ARMED (AGGRESSIVE + EARLY HARD TURN)")
+print("KP:", KP, "KF:", KF, "ANGLE_LIMIT:", ANGLE_LIMIT)
+print("EN_BOOST:", EN_BOOST, "@thr", EN_BOOST_THRESHOLD,
+      "| HD_BOOST:", HD_BOOST, "@thr", HD_BOOST_THRESHOLD)
+print("EARLY_HARD:", EARLY_HARD_TURN_ENABLE,
+      "HD_THR:", EARLY_HARD_HD_THRESHOLD,
+      "MIN_ANGLE:", EARLY_HARD_MIN_ANGLE,
+      "KP_SCALE:", EARLY_HARD_KP_SCALE)
+print("STEER_SMOOTH:", STEER_SMOOTH, "MAX_ANGLE_STEP:", MAX_ANGLE_STEP)
+print("NC_JUMP_LIMIT:", NC_JUMP_LIMIT, "FC_JUMP_LIMIT:", FC_JUMP_LIMIT)
+print("LOST_HOLD_FRAMES:", LOST_HOLD_FRAMES, "LOST_STOP_FRAMES:",
+LOST_STOP_FRAMES)
+print("WHITE_THRESHOLD:", WHITE_THRESHOLD)
+print("HOUGH_THRESHOLD:", HOUGH_THRESHOLD)
+print("SERVO:", SERVO_MIN, SERVO_CENTER, SERVO_MAX)
+
+prev_angle = 0.0
+lost_counter = 0
+last_servo_us = SERVO_CENTER
+last_near_center = None
+last_far_center = None
+last_l_far_xb = None
+last_r_far_xb = None
+last_l_near_xb = None
+last_r_near_xb = None
+last_near_mode = None
+last_far_mode = None
+frame_count = 0
+
+flip_rejects = 0
+jump_rejects = 0
+
+
+# ========================= Main Loop =========================
+while True:
+    clock.tick()
+    frame_count += 1
+
+    img = sensor.snapshot()
+    work = make_work_image(img)
+
+    if DEBUG_VIEW == "binary":
+        img.replace(work)
+
+    L_far = find_lane_line(
+        work, LEFT_FAR_ROI, "L", Y_FAR_TOP, Y_FAR_BOT,
+        EXPECTED_L_FAR_X, last_l_far_xb, CONTINUITY_WEIGHT_FAR,
+    )
+    R_far = find_lane_line(
+        work, RIGHT_FAR_ROI, "R", Y_FAR_TOP, Y_FAR_BOT,
+        EXPECTED_R_FAR_X, last_r_far_xb, CONTINUITY_WEIGHT_FAR,
+    )
+    L_near = find_lane_line(
+        work, LEFT_NEAR_ROI, "L", Y_NEAR_TOP, Y_NEAR_BOT,
+        EXPECTED_L_NEAR_X, last_l_near_xb, CONTINUITY_WEIGHT_NEAR,
+    )
+    R_near = find_lane_line(
+        work, RIGHT_NEAR_ROI, "R", Y_NEAR_TOP, Y_NEAR_BOT,
+        EXPECTED_R_NEAR_X, last_r_near_xb, CONTINUITY_WEIGHT_NEAR,
+    )
+
+    nc_raw, near_mode, lw_near, conf_near = estimate_center_with_check(
+        L_near, R_near, Y_NEAR_SAMPLE,
+        LANE_WIDTH_NEAR, LANE_WIDTH_NEAR_MIN, LANE_WIDTH_NEAR_MAX,
+        EXPECTED_L_NEAR_X, EXPECTED_R_NEAR_X,
+    )
+
+    fc_raw, far_mode, lw_far, conf_far = estimate_center_with_check(
+        L_far, R_far, Y_FAR_SAMPLE,
+        LANE_WIDTH_FAR, LANE_WIDTH_FAR_MIN, LANE_WIDTH_FAR_MAX,
+        EXPECTED_L_FAR_X, EXPECTED_R_FAR_X,
+    )
+
+    # ---------- FLIP REJECT ----------
+    near_prev_side = mode_side(last_near_mode)
+    near_curr_side = mode_side(near_mode)
+    if (near_prev_side is not None and near_curr_side is not None
+            and near_prev_side != near_curr_side):
+        nc_raw = None
+        near_mode = None
+        conf_near = None
+        flip_rejects += 1
+
+    far_prev_side = mode_side(last_far_mode)
+    far_curr_side = mode_side(far_mode)
+    if (far_prev_side is not None and far_curr_side is not None
+            and far_prev_side != far_curr_side):
+        fc_raw = None
+        far_mode = None
+        conf_far = None
+        flip_rejects += 1
+
+    # ---------- JUMP REJECT ----------
+    if last_near_center is not None and nc_raw is not None:
+        if abs(nc_raw - last_near_center) > NC_JUMP_LIMIT:
+            nc_raw = None
+            near_mode = None
+            conf_near = None
+            jump_rejects += 1
+
+    if last_far_center is not None and fc_raw is not None:
+        if abs(fc_raw - last_far_center) > FC_JUMP_LIMIT:
+            fc_raw = None
+            far_mode = None
+            conf_far = None
+            jump_rejects += 1
+
+    last_l_near_xb, last_r_near_xb = update_continuity(
+        near_mode, L_near, R_near, Y_NEAR_BOT, last_l_near_xb, last_r_near_xb,
+    )
+
+    last_l_far_xb, last_r_far_xb = update_continuity(
+        far_mode, L_far, R_far, Y_FAR_BOT, last_l_far_xb, last_r_far_xb,
+    )
+
+    if near_mode is not None:
+        last_near_mode = near_mode
+    if far_mode is not None:
+        last_far_mode = far_mode
+
+    conf = combined_conf(conf_near, conf_far)
+
+    near_center = smooth_center(
+        nc_raw, last_near_center,
+        conf_near if conf_near is not None else CONF_LOW,
+    )
+
+    far_center = smooth_center(
+        fc_raw, last_far_center,
+        conf_far if conf_far is not None else CONF_LOW,
+    )
+
+    if near_center is not None:
+        last_near_center = near_center
+    if far_center is not None:
+        last_far_center = far_center
+
+    err_near = 0
+    heading_err = 0
+    raw_angle = 0.0
+    filt_angle = prev_angle
+    kp_used = KP
+    kf_used = 0.0
+    early_flag = 0
+
+    if near_center is not None or far_center is not None:
+        if near_center is None:
+            near_center = far_center
+        if far_center is None:
+            far_center = near_center
+
+        err_near = near_center - TARGET_X
+        heading_err = far_center - near_center
+
+        kp_used = kp_effective(err_near)
+        kf_used = kf_effective(heading_err, conf)
+
+        # === EARLY HARD TURN STEERING LAW ===
+        normal_raw = kp_used * err_near + kf_used * heading_err
+        raw_angle = apply_early_hard_turn(err_near, heading_err, kp_used, kf_used)
+
+        if raw_angle != normal_raw:
+            early_flag = 1
+
+        raw_angle = clamp(raw_angle, -ANGLE_LIMIT, ANGLE_LIMIT)
+
+        if conf == CONF_LOW:
+            raw_angle = 0.65 * raw_angle + 0.35 * prev_angle
+
+        target_angle = (
+            STEER_SMOOTH * raw_angle
+            + (1.0 - STEER_SMOOTH) * prev_angle
+        )
+
+        filt_angle = clamp(
+            target_angle,
+            prev_angle - MAX_ANGLE_STEP,
+            prev_angle + MAX_ANGLE_STEP,
+        )
+
+        prev_angle = filt_angle
+        lost_counter = 0
+
+        motor_f = MOTOR_STRAIGHT - SPEED_K * abs(filt_angle)
+        if conf == CONF_LOW:
+            motor_f -= SPEED_CONF_PENALTY
+
+        motor = int(clamp(motor_f, MOTOR_SHARP, MOTOR_STRAIGHT))
+
+        conf_tag = conf_to_text(conf)
+        if abs(filt_angle) > 10:
+            state = "TURN_" + conf_tag
+        else:
+            state = "STR_" + conf_tag
+
+        source = "N:" + (near_mode or "-") + " F:" + (far_mode or "-")
+
+        servo_us = SERVO_CENTER + SERVO_DIR * int(
+            filt_angle * ((SERVO_MAX - SERVO_CENTER) / ANGLE_LIMIT)
+        )
+
+        servo_us = int(clamp(servo_us, SERVO_MIN, SERVO_MAX))
+        last_servo_us = servo_us
+
+    else:
+        lost_counter += 1
+
+        if lost_counter <= LOST_HOLD_FRAMES:
+            servo_us = last_servo_us
+            motor = MOTOR_LOST
+            state = "LOST_HOLD"
+        elif lost_counter <= LOST_STOP_FRAMES:
+            servo_us = SERVO_CENTER
+            motor = MOTOR_LOST
+            state = "LOST_SEARCH"
+        else:
+            servo_us = SERVO_CENTER
+            motor = 0
+            prev_angle = 0.0
+            filt_angle = 0.0
+            state = "LOST_STOP"
+
+        source = "NONE"
+        conf = None
+
+    servo_write(servo_us)
+    motor_write(motor)
+
+    draw_debug(
+        img,
+        (L_far, R_far, L_near, R_near),
+        near_center,
+        far_center,
+    )
+
+    if frame_count % PRINT_EVERY_N == 0:
+        print(
+            "st:", state,
+            "| src:", source,
+            "| cf:", conf_to_text(conf),
+            "| nc:", ("-" if near_center is None else near_center),
+            "| fc:", ("-" if far_center is None else far_center),
+            "| lwN:", ("-" if lw_near is None else lw_near),
+            "| lwF:", ("-" if lw_far is None else lw_far),
+            "| eN:", err_near,
+            "| hd:", heading_err,
+            "| kp:", round(kp_used, 2),
+            "| kf:", round(kf_used, 2),
+            "| early:", early_flag,
+            "| raw:", round(raw_angle, 1),
+            "| ang:", round(filt_angle, 1),
+            "| svo_us:", servo_us,
+            "| mot:", motor,
+            "| lost:", lost_counter,
+            "| rjF:", flip_rejects,
+            "| rjJ:", jump_rejects,
+            "| fps:", round(clock.fps(), 1),
+        )
+
